@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import socket
 import time
@@ -35,6 +36,8 @@ from urllib.parse import quote
 import requests
 
 from core.network import decode_best
+
+logger = logging.getLogger("networkauth")
 
 DEFAULT_BASE = "http://10.2.255.26"
 DEFAULT_EPORTAL_PORT = 801
@@ -249,7 +252,17 @@ class PortalClient:
             )
 
         text = decode_best(resp.content)
-        return self._judge(text, resp.status_code, masked)
+        result = self._judge(text, resp.status_code, masked)
+        if result.ok:
+            logger.info("登录结果 %s：%s", result.verdict, result.message)
+        else:
+            logger.warning(
+                "登录失败：%s | 请求 %s | 响应 %s",
+                result.message,
+                masked,
+                result.detail[:300],
+            )
+        return result
 
     def _judge(self, text: str, status: int, masked_request: str) -> LoginResult:
         detail = re.sub(r"\s+", " ", text)[:600]
@@ -282,25 +295,43 @@ class PortalClient:
 
     # ---------- 注销 ----------
 
-    def logout(self) -> bool:
+    def logout(self, username: str = "", password: str = "", suffix: str = "") -> bool:
+        """注销当前在线账号。
+
+        端点 ``GET /eportal/portal/logout`` 尚未在真机实测（实测会断开当前网络），
+        因此这里把结果只当作"请求已被门户受理"的参考，并完整写入日志便于后续对照。
+        """
         config = self.discover()
         params = self._common_params(config)
-        params[config.user_field] = ""
-        params[config.pass_field] = ""
+        params[config.user_field] = f"{username or ''}{suffix or ''}"
+        params[config.pass_field] = password or ""
+
+        url = config.api_base() + "logout"
+        masked = f"GET {url}?{self._mask(params, config.pass_field)}"
+
         try:
             resp = self.session.get(
-                config.api_base() + "logout",
+                url,
                 params=params,
                 timeout=self.timeout,
                 headers={"Referer": self.base + "/"},
             )
-        except requests.RequestException:
-            return False
-        if resp.status_code != 200:
+        except requests.RequestException as exc:
+            logger.warning("注销请求失败：%s", type(exc).__name__)
             return False
 
-        data = parse_jsonp(decode_best(resp.content))
-        if data is None:
+        if resp.status_code != 200:
+            logger.warning("注销请求返回 HTTP %s", resp.status_code)
             return False
+
+        text = decode_best(resp.content)
+        data = parse_jsonp(text)
+        if data is None:
+            logger.warning("注销响应无法解析：%s", re.sub(r"\s+", " ", text)[:200])
+            return False
+
         msg = str(data.get("msg") or "")
-        return str(data.get("result", "")) == "1" or any(w in msg for w in _LOGOUT_SUCCESS_WORDS)
+        ok = str(data.get("result", "")) == "1" or any(word in msg for word in _LOGOUT_SUCCESS_WORDS)
+        logger.info("注销%s：%s", "成功" if ok else "未确认", msg or "(无消息)")
+        logger.debug("注销请求行：%s", masked)
+        return ok

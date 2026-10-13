@@ -50,10 +50,13 @@ def is_enabled() -> bool:
     return bool(value)
 
 
-def set_enabled(enabled: bool) -> bool:
-    """开启/关闭开机自启，返回操作是否成功。"""
+def set_enabled(enabled: bool) -> tuple[bool, str]:
+    """开启/关闭开机自启。
+
+    返回 ``(是否成功, 失败原因)``；失败原因用于界面提示，成功时为空串。
+    """
     if not _IS_WIN:
-        return False
+        return False, "当前系统不支持注册表自启"
     try:
         import winreg
 
@@ -63,11 +66,11 @@ def set_enabled(enabled: bool) -> bool:
             else:
                 try:
                     winreg.DeleteValue(key, VALUE_NAME)
-                except OSError:
+                except FileNotFoundError:
                     pass
-    except OSError:
-        return False
-    return True
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, ""
 
 
 def current_command() -> Optional[str]:

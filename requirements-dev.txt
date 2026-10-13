@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# 构建与打包依赖（终端用户不需要）
+pyinstaller>=6.3.0

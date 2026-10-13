@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import binascii
 import json
+import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -16,9 +19,14 @@ from typing import Any, Optional
 
 from core import credential
 
+logger = logging.getLogger("networkauth")
+
 APP_NAME = "NetworkAuth"
 
 DEFAULT_BASE = "http://10.2.255.26"
+
+# 配置结构版本，便于后续迁移
+CURRENT_VERSION = 2
 
 DEFAULT_OPTIONS: dict[str, Any] = {
     "auto_login": True,          # 检测到未认证时自动登录
@@ -26,10 +34,11 @@ DEFAULT_OPTIONS: dict[str, Any] = {
     "notify": True,              # Windows 通知
     "interval": 15,              # 未认证时的检测间隔（秒）
     "interval_online": 60,       # 已认证时的检测间隔（秒）
-    "login_method": "GET",       # 门户登录请求方式 GET / POST
     "close_to_tray": True,       # 关闭窗口时最小化到托盘
     "auto_start": False,         # 开机自启（镜像注册表状态）
 }
+# 注：门户登录固定使用 GET（该门户对 POST 返回"无法获取用户认证账号"），
+# 因此不再提供"请求方式"选项。
 
 MAX_HISTORY = 300
 
@@ -65,9 +74,12 @@ class Profile:
 
     @property
     def password(self) -> str:
+        # 配置被外部修改/换 Windows 用户时可能解不开，这里一律降级为空串，
+        # 避免 binascii.Error / UnicodeDecodeError 直接冒到界面线程。
         try:
             return credential.unprotect(self.password_enc)
-        except OSError:
+        except (OSError, ValueError, binascii.Error, UnicodeDecodeError):
+            logger.warning("凭据解密失败，已按空密码处理")
             return ""
 
     @password.setter
@@ -111,44 +123,95 @@ class ConfigStore:
             "history": [],
         }
 
+    def backup_path(self) -> str:
+        return self.path + ".bak"
+
+    @staticmethod
+    def _read_json(path: str) -> tuple[dict[str, Any], bool]:
+        """读取 JSON，返回 (内容, 是否损坏)。文件不存在视为未损坏的空配置。"""
+        if not os.path.exists(path):
+            return {}, False
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+        except (OSError, ValueError) as exc:
+            logger.error("配置文件无法解析：%s（%s）", path, exc)
+            return {}, True
+        if not isinstance(loaded, dict):
+            logger.error("配置文件结构异常（顶层不是对象）：%s", path)
+            return {}, True
+        return loaded, False
+
+    def _quarantine(self) -> str:
+        """把损坏的配置改名留档，避免直接覆盖丢失现场。"""
+        target = f"{self.path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            os.replace(self.path, target)
+            logger.warning("损坏的配置已留档：%s", target)
+            return target
+        except OSError as exc:
+            logger.error("无法留档损坏的配置：%s", exc)
+            return ""
+
     def load(self) -> None:
         with self._lock:
+            loaded, damaged = self._read_json(self.path)
+            if damaged:
+                self._quarantine()
+                restored, restore_damaged = self._read_json(self.backup_path())
+                if restored and not restore_damaged:
+                    logger.warning("已从备份恢复配置：%s", self.backup_path())
+                    loaded = restored
+                else:
+                    logger.error("没有可用备份，配置已重置为默认值")
+
             data = self._default_data()
-            try:
-                with open(self.path, "r", encoding="utf-8") as handle:
-                    loaded = json.load(handle)
-            except (OSError, ValueError):
-                loaded = {}
-            if isinstance(loaded, dict):
-                data["portal_base"] = loaded.get("portal_base", DEFAULT_BASE) or DEFAULT_BASE
-                options = dict(DEFAULT_OPTIONS)
-                stored_options = loaded.get("options") or {}
-                if isinstance(stored_options, dict):
-                    options.update({k: v for k, v in stored_options.items() if k in DEFAULT_OPTIONS})
-                data["options"] = options
-                profiles = loaded.get("profiles")
-                if isinstance(profiles, dict):
-                    data["profiles"] = {
-                        str(k): Profile.from_dict(v).to_dict()
-                        for k, v in profiles.items()
-                        if isinstance(v, dict)
-                    }
-                history = loaded.get("history")
-                if isinstance(history, list):
-                    data["history"] = [h for h in history if isinstance(h, dict)][-MAX_HISTORY:]
+            data["portal_base"] = str(loaded.get("portal_base") or DEFAULT_BASE)
+
+            options = dict(DEFAULT_OPTIONS)
+            stored_options = loaded.get("options")
+            if isinstance(stored_options, dict):
+                options.update({k: v for k, v in stored_options.items() if k in DEFAULT_OPTIONS})
+            data["options"] = options
+
+            profiles = loaded.get("profiles")
+            if isinstance(profiles, dict):
+                data["profiles"] = {
+                    str(key): Profile.from_dict(value).to_dict()
+                    for key, value in profiles.items()
+                    if isinstance(value, dict)
+                }
+
+            history = loaded.get("history")
+            if isinstance(history, list):
+                data["history"] = [item for item in history if isinstance(item, dict)][-MAX_HISTORY:]
+
+            data["version"] = self._migrate(loaded.get("version"))
             self.data = data
+
+    @staticmethod
+    def _migrate(stored_version: Any) -> int:
+        """把旧结构版本标记为当前版本（字段级兼容由上面的解析逻辑兜底）。"""
+        try:
+            version = int(stored_version or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version != CURRENT_VERSION:
+            logger.info("配置版本 %s -> %s", version, CURRENT_VERSION)
+        return CURRENT_VERSION
 
     def save(self) -> None:
         with self._lock:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            payload = json.dumps(self.data, ensure_ascii=False, indent=2)
             directory = os.path.dirname(self.path)
+            os.makedirs(directory, exist_ok=True)
+            payload = json.dumps(self.data, ensure_ascii=False, indent=2)
             handle = tempfile.NamedTemporaryFile(
                 "w", encoding="utf-8", dir=directory, delete=False, suffix=".tmp"
             )
             try:
                 with handle:
                     handle.write(payload)
+                self._refresh_backup()
                 os.replace(handle.name, self.path)
             except OSError:
                 try:
@@ -156,6 +219,15 @@ class ConfigStore:
                 except OSError:
                     pass
                 raise
+
+    def _refresh_backup(self) -> None:
+        """保留上一份可用配置作为备份，供损坏时恢复。"""
+        if not os.path.exists(self.path):
+            return
+        try:
+            shutil.copy2(self.path, self.backup_path())
+        except OSError as exc:
+            logger.warning("备份配置失败：%s", exc)
 
     # ---------- 选项 ----------
 

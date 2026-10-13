@@ -10,7 +10,7 @@ a = Analysis(
     datas=[('resources/app.ico', 'resources')],
     hiddenimports=[
         'core', 'core.portal', 'core.network', 'core.config', 'core.credential',
-        'core.daemon', 'core.autostart',
+        'core.daemon', 'core.autostart', 'core.logging_setup',
         'app', 'app.main_window', 'app.tray', 'app.settings_dialog',
         'app.log_dialog', 'app.theme', 'app.widgets', 'app.icons',
         'requests',

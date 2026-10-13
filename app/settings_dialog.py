@@ -1,35 +1,31 @@
-"""设置弹窗：开机自启、检测策略、网络绑定管理。"""
+"""设置弹窗：行为开关、检测策略、门户地址与网络绑定管理。"""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
-    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from app import icons, theme
-from app.widgets import Switch
+from app.widgets import ComboBox, DialogHeader, InputFrame, Switch, field_label, h_switch_row
 from core import autostart
 from core.config import ConfigStore
 
-
-def _force_opaque(widget: QWidget) -> None:
-    """强制不透明：分层窗口整窗 alpha=0 会导致透明且鼠标点击穿透。"""
-    widget.setAutoFillBackground(True)
-    palette = widget.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#FFFFFF"))
-    widget.setPalette(palette)
+# 已保存网络列表按行数自适应高度
+_LIST_ROW_HEIGHT = 34
+_LIST_MIN_ROWS = 2
+_LIST_MAX_ROWS = 5
 
 
 class SettingsDialog(QDialog):
@@ -40,13 +36,27 @@ class SettingsDialog(QDialog):
         self.store = store
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
         self.setWindowIcon(icons.app_icon())
-        self.setFixedWidth(500)
+        self.setFixedWidth(theme.DIALOG_WIDTH)
         self.setWindowTitle("设置")
 
         self._build_ui()
         self._load()
-        self.adjustSize()
-        self.setFixedHeight(self.height())
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """按内容自适应高度；内容超出可用屏幕高度时交给滚动区，底部按钮始终可见。"""
+        self._body.adjustSize()
+        content = (
+            self._header.height()
+            + self._body.sizeHint().height()
+            + self._footer.sizeHint().height()
+            + 2
+        )
+        screen = QGuiApplication.primaryScreen()
+        limit = int(screen.availableGeometry().height() * 0.94) if screen else content
+        self.setFixedHeight(max(400, min(content, limit)))
+
+    # ------------------------------------------------------------------ 界面
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -54,111 +64,155 @@ class SettingsDialog(QDialog):
 
         self._root = QFrame(self)
         self._root.setObjectName("root")
-        _force_opaque(self._root)
+        theme.make_opaque(self)
+        theme.make_opaque(self._root)
         outer.addWidget(self._root)
 
-        layout = QVBoxLayout(self._root)
-        layout.setContentsMargins(20, 16, 20, 18)
-        layout.setSpacing(12)
+        root_layout = QVBoxLayout(self._root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        title = QLabel("设置")
-        title.setObjectName("statusTitle")
-        layout.addWidget(title)
+        self._header = DialogHeader("设置", self._root)
+        self._header.closeRequested.connect(self.reject)
+        root_layout.addWidget(self._header)
 
-        # 行为开关
-        layout.addWidget(self._group(
-            self._switch_row("开机自启", "auto_start"),
-            self._switch_row("关闭窗口时最小化到托盘", "close_to_tray"),
-            self._switch_row("检测到未认证时自动登录", "auto_login"),
-            self._switch_row("掉线或被踢下线时自动重连", "reconnect"),
-            self._switch_row("登录/失败时弹出 Windows 通知", "notify"),
-        ))
+        # 内容放进滚动区：小屏上也能保证底部按钮始终可达
+        self._scroll = QScrollArea(self._root)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        root_layout.addWidget(self._scroll, 1)
 
-        # 策略参数
+        self._body = QWidget()
+        layout = QVBoxLayout(self._body)
+        layout.setContentsMargins(16, 12, 16, 4)
+        layout.setSpacing(10)
+        self._scroll.setWidget(self._body)
+
+        layout.addWidget(
+            self._section(
+                "行为",
+                [
+                    self._switch_row("开机自启", "auto_start"),
+                    self._switch_row("关闭窗口时最小化到托盘", "close_to_tray"),
+                    self._switch_row("检测到未认证时自动登录", "auto_login"),
+                    self._switch_row("掉线或被踢下线时自动重连", "reconnect"),
+                    self._switch_row("登录/失败时弹出 Windows 通知", "notify"),
+                ],
+            )
+        )
+
         strategy = QHBoxLayout()
-        strategy.setSpacing(16)
-        strategy.addLayout(self._combo_row("检测间隔", "interval", [("10 秒", 10), ("15 秒", 15), ("30 秒", 30), ("60 秒", 60)]))
-        strategy.addLayout(self._combo_row("请求方式", "login_method", [("GET", "GET"), ("POST", "POST")]))
-        layout.addLayout(strategy)
+        strategy.setSpacing(theme.GAP_LG)
+        strategy.addLayout(
+            self._combo_row(
+                "检测间隔",
+                "interval",
+                [("10 秒", 10), ("15 秒", 15), ("30 秒", 30), ("60 秒", 60)],
+            ),
+            1,
+        )
+        strategy.addLayout(
+            self._combo_row(
+                "已在线时的间隔",
+                "interval_online",
+                [("30 秒", 30), ("60 秒", 60), ("120 秒", 120), ("300 秒", 300)],
+            ),
+            1,
+        )
+        layout.addWidget(self._wrap("检测策略", strategy))
 
-        # 门户地址
-        portal_label = QLabel("认证门户地址", self._root)
-        portal_label.setObjectName("fieldLabel")
-        layout.addWidget(portal_label)
-        self._portal_edit = QLineEdit(self._root)
-        self._portal_edit.setPlaceholderText("http://10.2.255.26")
+        # 门户地址（复用主界面同款输入框，保证边框与聚焦态一致）
+        portal_box = QVBoxLayout()
+        portal_box.setSpacing(theme.GAP_SM)
+        self._portal_edit = InputFrame(placeholder="http://10.2.255.26")
         self._portal_edit.setToolTip("普通用户无需修改")
-        layout.addWidget(self._portal_edit)
+        portal_box.addWidget(field_label("认证门户地址", self._body))
+        portal_box.addWidget(self._portal_edit)
+        layout.addWidget(self._wrap("门户", portal_box))
 
         # 已保存网络
-        saved_label = QLabel("已保存的网络账号", self._root)
-        saved_label.setObjectName("fieldLabel")
-        layout.addWidget(saved_label)
-        self._network_list = QListWidget(self._root)
-        self._network_list.setMaximumHeight(120)
-        layout.addWidget(self._network_list)
-
-        delete_btn = QPushButton("删除选中的绑定", self._root)
-        delete_btn.setObjectName("ghostButton")
+        saved_box = QVBoxLayout()
+        saved_box.setSpacing(theme.GAP_SM)
+        self._network_list = QListWidget(self._body)
+        self._network_list.setMinimumHeight(_LIST_MIN_ROWS * _LIST_ROW_HEIGHT)
+        delete_btn = QPushButton("删除选中的绑定", self._body)
+        delete_btn.setObjectName("outlineButton")
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         delete_btn.clicked.connect(self._delete_selected)
-        layout.addWidget(delete_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        saved_box.addWidget(field_label("已保存的网络账号", self._body))
+        saved_box.addWidget(self._network_list)
+        saved_box.addWidget(delete_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._wrap("网络绑定", saved_box))
 
+        # 内容不足时把剩余空间留在底部，卡片整体靠上
         layout.addStretch()
 
-        # 按钮
-        btn_row = QHBoxLayout()
+        # 底部按钮固定在滚动区之外，内容再长也不会被挤出屏幕
+        self._footer = QWidget(self._root)
+        btn_row = QHBoxLayout(self._footer)
+        btn_row.setContentsMargins(16, 10, 16, 16)
+        btn_row.setSpacing(theme.GAP_SM)
         btn_row.addStretch()
-        cancel = QPushButton("取消", self._root)
-        cancel.setObjectName("ghostButton")
+        cancel = QPushButton("取消", self._footer)
+        cancel.setObjectName("outlineButton")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel.clicked.connect(self.reject)
-        save = QPushButton("保存", self._root)
+        save = QPushButton("保存", self._footer)
         save.setObjectName("primaryButton")
-        save.setFixedWidth(80)
+        save.setFixedWidth(88)
+        save.setCursor(Qt.CursorShape.PointingHandCursor)
         save.clicked.connect(self._save)
         btn_row.addWidget(cancel)
         btn_row.addWidget(save)
-        layout.addLayout(btn_row)
+        root_layout.addWidget(self._footer)
 
-    def _group(self, *rows: QHBoxLayout) -> QWidget:
-        widget = QWidget(self._root)
-        widget.setObjectName("formCard")
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+    def _section(self, title: str, rows: list[QHBoxLayout]) -> QWidget:
+        box = QVBoxLayout()
+        box.setSpacing(theme.GAP_MD)
         for row in rows:
-            layout.addLayout(row)
-        return widget
+            box.addLayout(row)
+        return self._wrap(title, box)
+
+    def _wrap(self, title: str, content) -> QWidget:
+        """把一组设置包进统一的白色分区卡片。"""
+        card = QWidget(self._body)
+        card.setObjectName("sectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(theme.GAP_SM + 2)
+
+        label = QLabel(title, card)
+        label.setObjectName("sectionTitle")
+        layout.addWidget(label)
+        layout.addLayout(content)
+        return card
 
     def _switch_row(self, label: str, option_key: str) -> QHBoxLayout:
-        layout = QHBoxLayout()
-        layout.setSpacing(10)
-        switch = Switch(self._root)
+        switch = Switch(self._body)
         switch.setObjectName(option_key)
-        lbl = QLabel(label)
-        lbl.setObjectName("statusSub")
-        layout.addWidget(switch)
-        layout.addWidget(lbl)
-        layout.addStretch()
-        return layout
+        return h_switch_row(label, switch)
 
-    def _combo_row(self, label: str, option_key: str, items: list[tuple[str, object]]) -> QVBoxLayout:
+    def _combo_row(
+        self, label: str, option_key: str, items: list[tuple[str, object]]
+    ) -> QVBoxLayout:
         layout = QVBoxLayout()
-        layout.setSpacing(6)
-        lbl = QLabel(label)
-        lbl.setObjectName("fieldLabel")
-        layout.addWidget(lbl)
-        combo = QComboBox(self._root)
+        layout.setSpacing(theme.GAP_SM)
+        layout.addWidget(field_label(label, self._body))
+        combo = ComboBox(self._body)
         combo.setObjectName(option_key)
         for text, value in items:
             combo.addItem(text, value)
         layout.addWidget(combo)
         return layout
 
+    # ------------------------------------------------------------------ 数据
+
     def _find_switch(self, key: str) -> Switch:
         return self._root.findChild(Switch, key)
 
-    def _find_combo(self, key: str) -> QComboBox:
-        return self._root.findChild(QComboBox, key)
+    def _find_combo(self, key: str) -> ComboBox:
+        return self._root.findChild(ComboBox, key)
 
     def _load(self) -> None:
         options = self.store.options
@@ -174,10 +228,10 @@ class SettingsDialog(QDialog):
                 interval_combo.setCurrentIndex(i)
                 break
 
-        method_combo = self._find_combo("login_method")
-        for i in range(method_combo.count()):
-            if method_combo.itemData(i) == options.get("login_method", "GET"):
-                method_combo.setCurrentIndex(i)
+        online_combo = self._find_combo("interval_online")
+        for i in range(online_combo.count()):
+            if online_combo.itemData(i) == options.get("interval_online", 60):
+                online_combo.setCurrentIndex(i)
                 break
 
         self._portal_edit.setText(self.store.portal_base)
@@ -189,13 +243,15 @@ class SettingsDialog(QDialog):
             name = nid[5:] if nid.startswith("ssid:") else "有线网络"
             self._network_list.addItem(f"{name} · {username}({carrier})")
 
+        rows = max(_LIST_MIN_ROWS, min(_LIST_MAX_ROWS, self._network_list.count() or _LIST_MIN_ROWS))
+        self._network_list.setFixedHeight(rows * _LIST_ROW_HEIGHT + 8)
+
     def _delete_selected(self) -> None:
         row = self._network_list.currentRow()
         networks = self.store.saved_networks()
         if row < 0 or row >= len(networks):
             return
-        nid = networks[row][0]
-        self.store.remove_profile(nid)
+        self.store.remove_profile(networks[row][0])
         self._refresh_list()
 
     def _save(self) -> None:
@@ -204,29 +260,28 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "格式错误", "门户地址需要以 http:// 或 https:// 开头")
             return
 
-        new_options = {
-            "close_to_tray": self._find_switch("close_to_tray").isChecked(),
-            "auto_login": self._find_switch("auto_login").isChecked(),
-            "reconnect": self._find_switch("reconnect").isChecked(),
-            "notify": self._find_switch("notify").isChecked(),
-            "interval": int(self._find_combo("interval").currentData()),
-            "login_method": str(self._find_combo("login_method").currentData()).upper(),
-        }
-        self.store.set_options(new_options)
-        self.store.set_option("auto_start", self._find_switch("auto_start").isChecked())
-        autostart.set_enabled(self._find_switch("auto_start").isChecked())
+        self.store.set_options(
+            {
+                "close_to_tray": self._find_switch("close_to_tray").isChecked(),
+                "auto_login": self._find_switch("auto_login").isChecked(),
+                "reconnect": self._find_switch("reconnect").isChecked(),
+                "notify": self._find_switch("notify").isChecked(),
+                "interval": int(self._find_combo("interval").currentData()),
+                "interval_online": int(self._find_combo("interval_online").currentData()),
+            }
+        )
+
+        # 开机自启以注册表实际写入结果为准，失败时提示并回显真实状态
+        wanted = self._find_switch("auto_start").isChecked()
+        saved, reason = autostart.set_enabled(wanted)
+        actual = autostart.is_enabled()
+        self.store.set_option("auto_start", actual)
+        if not saved:
+            switch = self._find_switch("auto_start")
+            switch.blockSignals(True)
+            switch.setChecked(actual)
+            switch.blockSignals(False)
+            QMessageBox.warning(self, "开机自启设置失败", f"未能修改注册表自启项：{reason}")
+
         self.store.portal_base = base
         self.accept()
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        self._drag_pos = event.globalPosition().toPoint()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if hasattr(self, "_drag_pos"):
-            self.move(self.pos() + event.globalPosition().toPoint() - self._drag_pos)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)

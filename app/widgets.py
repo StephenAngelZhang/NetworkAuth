@@ -1,30 +1,48 @@
-"""轻量自定义控件：开关、分段选择、状态呼吸点、输入框容器。"""
+"""轻量自定义控件：输入框、下拉框、开关、分段选择、状态徽标、细进度条。"""
 
 from __future__ import annotations
 
+from typing import Optional
+
 from PyQt6.QtCore import (
     QEasingCurve,
+    QLineF,
+    QPoint,
     QPointF,
     QPropertyAnimation,
     QRectF,
     Qt,
     QTimer,
+    QVariantAnimation,
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
+    QComboBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QSizePolicy,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
-from app import theme
+from app import icons, theme
+
+
+def _blend(start: QColor, end: QColor, mix: float) -> QColor:
+    """线性插值两个颜色，用于 180~200ms 的颜色过渡。"""
+    ratio = max(0.0, min(1.0, float(mix)))
+    return QColor(
+        int(start.red() + (end.red() - start.red()) * ratio),
+        int(start.green() + (end.green() - start.green()) * ratio),
+        int(start.blue() + (end.blue() - start.blue()) * ratio),
+    )
 
 
 # --------------------------------------------------------------------------- 输入框
@@ -56,16 +74,21 @@ class InputFrame(QWidget):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("inputFrame")
+        # 自定义 QWidget 子类必须显式开启，否则 QSS 的 background/border 不会绘制
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setProperty("focused", "false")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(6)
 
         self.edit = _InnerLineEdit(self)
         self.edit.setPlaceholderText(placeholder)
-        self.edit.setMinimumHeight(22)
+        self.edit.setMinimumHeight(20)
+        palette = self.edit.palette()
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(theme.TEXT_MUTE))
+        self.edit.setPalette(palette)
         if password:
             self.edit.setEchoMode(QLineEdit.EchoMode.Password)
         layout.addWidget(self.edit)
@@ -78,6 +101,7 @@ class InputFrame(QWidget):
             self.reveal.setText("显示")
             self.reveal.setCheckable(True)
             self.reveal.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.reveal.setToolTip("显示/隐藏密码")
             self.reveal.toggled.connect(self._on_reveal)
             layout.addWidget(self.reveal)
 
@@ -110,6 +134,35 @@ class InputFrame(QWidget):
         self.edit.setPlaceholderText(value)
 
 
+# --------------------------------------------------------------------------- 下拉框
+
+
+class ComboBox(QComboBox):
+    """统一样式的下拉框：QSS 关掉原生箭头，这里自绘一个细箭头。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(38)
+        self.setMaxVisibleItems(10)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(theme.TEXT_SUB))
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+
+        center_x = self.width() - 16.0
+        center_y = self.height() / 2.0
+        painter.drawLine(QLineF(center_x - 4.0, center_y - 2.0, center_x, center_y + 2.0))
+        painter.drawLine(QLineF(center_x, center_y + 2.0, center_x + 4.0, center_y - 2.0))
+        painter.end()
+
+
 # --------------------------------------------------------------------------- 开关
 
 
@@ -120,7 +173,7 @@ class Switch(QAbstractButton):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(46, 26)
+        self.setFixedSize(44, 24)
         self._offset = 0.0
         self._on_color = QColor(theme.PRIMARY)
         self._off_color = QColor(theme.BORDER_STRONG)
@@ -150,20 +203,14 @@ class Switch(QAbstractButton):
 
         width, height = self.width(), self.height()
         radius = height / 2.0
-        progress = self._offset
-
-        track = QColor(
-            int(self._off_color.red() + (self._on_color.red() - self._off_color.red()) * progress),
-            int(self._off_color.green() + (self._on_color.green() - self._off_color.green()) * progress),
-            int(self._off_color.blue() + (self._on_color.blue() - self._off_color.blue()) * progress),
-        )
+        track = _blend(self._off_color, self._on_color, self._offset)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track)
         painter.drawRoundedRect(QRectF(0, 0, width, height), radius, radius)
 
         margin = 3.0
         knob = height - margin * 2
-        x = margin + progress * (width - margin * 2 - knob)
+        x = margin + self._offset * (width - margin * 2 - knob)
         painter.setBrush(QColor("#FFFFFF"))
         painter.drawEllipse(QRectF(x, margin, knob, knob))
 
@@ -179,6 +226,7 @@ class SegmentedControl(QWidget):
     def __init__(self, options: list[str] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("segmentBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(3, 3, 3, 3)
         self._layout.setSpacing(2)
@@ -187,8 +235,16 @@ class SegmentedControl(QWidget):
         self._buttons: list[QPushButton] = []
         self.setOptions(options or [])
 
-    def setOptions(self, options: list[str]) -> None:
+    def setOptions(self, options: list[str], keep_current: bool = True) -> None:
+        """重建选项。
+
+        ``keep_current=True`` 时会保留原有选中项——门户配置每次刷新都会调用这里，
+        以前无条件选中第一项会把用户选好的服务类型悄悄改掉。
+        """
+        previous = self.currentText() if keep_current else ""
+
         for button in self._buttons:
+            self._group.removeButton(button)
             self._layout.removeWidget(button)
             button.deleteLater()
         self._buttons.clear()
@@ -203,15 +259,23 @@ class SegmentedControl(QWidget):
             self._layout.addWidget(button)
             self._buttons.append(button)
 
-        # 让 QButtonGroup 的信号只连接一次
+        # 只断开自己的槽，避免误伤其他连接
         try:
-            self._group.idClicked.disconnect()
+            self._group.idClicked.disconnect(self._on_clicked)
         except (TypeError, RuntimeError):
             pass
         self._group.idClicked.connect(self._on_clicked)
 
-        if self._buttons:
+        if previous and previous in options:
+            self._check(previous)
+        elif self._buttons:
             self._buttons[0].setChecked(True)
+
+    def _check(self, text: str) -> None:
+        for button in self._buttons:
+            if button.text() == text:
+                button.setChecked(True)
+                return
 
     def _on_clicked(self, _index: int) -> None:
         self.currentTextChanged.emit(self.currentText())
@@ -221,32 +285,45 @@ class SegmentedControl(QWidget):
         return button.text() if button else ""
 
     def setCurrentText(self, text: str) -> None:
-        for button in self._buttons:
-            if button.text() == text:
-                button.setChecked(True)
-                return
-        if self._buttons:
+        if text and any(button.text() == text for button in self._buttons):
+            self._check(text)
+        elif self._buttons and not self._group.checkedButton():
             self._buttons[0].setChecked(True)
 
 
-# --------------------------------------------------------------------------- 状态呼吸点
+# --------------------------------------------------------------------------- 状态徽标
 
 
-class StatusDot(QWidget):
-    """带呼吸光晕的状态色点。"""
+class StatusBadge(QWidget):
+    """图标化状态徽标：浅色圆底 + 线性图标 + 呼吸光晕。"""
 
-    def __init__(self, size: int = 12, parent: QWidget | None = None) -> None:
+    def __init__(self, size: int = 48, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._size = size
-        self.setFixedSize(size * 3, size * 3)
+        self.setFixedSize(size, size)
+
+        self._glyph = "alert"
         self._color = QColor(theme.OFFLINE)
+        self._tint = QColor(theme.OFFLINE_SOFT)
+        self._intensity = 0.45
         self._pulse = 0.0
-        self._animation = QPropertyAnimation(self, b"pulse", self)
-        self._animation.setStartValue(0.0)
-        self._animation.setEndValue(1.0)
-        self._animation.setDuration(1600)
-        self._animation.setLoopCount(-1)
-        self._animation.start()
+        self._from = (QColor(self._color), QColor(self._tint))
+        self._to = (QColor(self._color), QColor(self._tint))
+        self._badge = icons.badge_pixmap(
+            self._glyph, size, self._color.name(), self._tint.name()
+        )
+
+        self._breath = QPropertyAnimation(self, b"pulse", self)
+        self._breath.setStartValue(0.0)
+        self._breath.setEndValue(1.0)
+        self._breath.setDuration(1800)
+        self._breath.setLoopCount(-1)
+        self._breath.start()
+
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(200)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.valueChanged.connect(self._on_fade)
 
     def get_pulse(self) -> float:
         return self._pulse
@@ -257,36 +334,51 @@ class StatusDot(QWidget):
 
     pulse = pyqtProperty(float, fget=get_pulse, fset=set_pulse)
 
-    def setColor(self, color: QColor | str) -> None:
-        self._color = QColor(color)
+    def setState(self, state: str) -> None:
+        """按状态元数据切换图标与配色（认证中时呼吸更明显）。"""
+        style = theme.state_style(state)
+        self.apply(style.glyph, style.color, style.tint, 1.0 if state == "logging" else 0.45)
+
+    def apply(self, glyph: str, color: str, tint: str, intensity: float = 0.45) -> None:
+        self._glyph = glyph
+        self._intensity = intensity
+        self._from = (QColor(self._color), QColor(self._tint))
+        self._to = (QColor(color), QColor(tint))
+        self._fade.stop()
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.start()
+
+    def _on_fade(self, value) -> None:
+        self._color = _blend(self._from[0], self._to[0], value)
+        self._tint = _blend(self._from[1], self._to[1], value)
+        self._badge = icons.badge_pixmap(
+            self._glyph, self._size, self._color.name(), self._tint.name()
+        )
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        center = QPointF(self.width() / 2.0, self.height() / 2.0)
-        radius = self._size / 2.0
 
-        wave = self._pulse
-        halo_alpha = int(70 * (1.0 - wave))
-        if halo_alpha > 0:
+        alpha = int(70 * self._intensity * (1.0 - self._pulse))
+        if alpha > 0:
             halo = QColor(self._color)
-            halo.setAlpha(halo_alpha)
+            halo.setAlpha(alpha)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(halo)
-            halo_radius = radius + radius * 1.1 * wave
-            painter.drawEllipse(center, halo_radius, halo_radius)
+            radius = self._size / 2.0 + self._size * 0.16 * self._pulse
+            painter.drawEllipse(QPointF(self._size / 2.0, self._size / 2.0), radius, radius)
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(self._color)
-        painter.drawEllipse(center, radius, radius)
+        painter.drawPixmap(0, 0, self._badge)
+        painter.end()
 
 
 # --------------------------------------------------------------------------- 细进度条
 
 
 class BusyBar(QWidget):
-    """登录进行中的细进度条。"""
+    """登录进行中的细进度条（不确定进度）。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -318,7 +410,7 @@ class BusyBar(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(theme.BORDER))
+        painter.setBrush(QColor(theme.BG_MUTE))
         painter.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 1.5, 1.5)
 
         span = self.width() * 0.34
@@ -329,25 +421,94 @@ class BusyBar(QWidget):
         gradient.setColorAt(1, QColor(theme.PRIMARY_SOFT))
         painter.setBrush(gradient)
         painter.drawRoundedRect(QRectF(start, 0, span, self.height()), 1.5, 1.5)
+        painter.end()
 
 
-# --------------------------------------------------------------------------- 圆角路径工具
+# --------------------------------------------------------------------------- 弹窗标题栏
 
 
-def rounded_path(rect: QRectF, radius: float) -> QPainterPath:
-    path = QPainterPath()
-    path.addRoundedRect(rect, radius, radius)
-    return path
+class DialogHeader(QWidget):
+    """无边框弹窗的标题栏：标题 + 关闭按钮，支持拖拽移动窗口。"""
+
+    closeRequested = pyqtSignal()
+
+    def __init__(self, title: str, parent: QWidget | None = None, height: int = 50) -> None:
+        super().__init__(parent)
+        self.setObjectName("titleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(height)
+        self._drag_pos: Optional[QPoint] = None
+        self._window_start = QPoint()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 12, 0)
+        layout.setSpacing(8)
+
+        label = QLabel(title, self)
+        label.setObjectName("appTitle")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(label)
+        layout.addStretch()
+
+        close = QPushButton("✕", self)
+        close.setObjectName("closeButton")
+        close.setFixedSize(30, 30)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("关闭")
+        close.clicked.connect(self.closeRequested)
+        layout.addWidget(close)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint()
+            self._window_start = self.window().pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_pos is not None:
+            delta = event.globalPosition().toPoint() - self._drag_pos
+            self.window().move(self._window_start + delta)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
 
 
-def divider_pen(color: str = theme.BORDER, width: float = 1.0) -> QPen:
-    pen = QPen(QColor(color))
-    pen.setWidthF(width)
-    return pen
+# --------------------------------------------------------------------------- 小工具
 
 
-def heading_font(size: int = 14, weight: int = 600) -> QFont:
-    font = QFont()
-    font.setPointSize(size)
-    font.setWeight(weight)
-    return font
+def set_tone(widget: QWidget, tone: str) -> None:
+    """设置动态属性 ``tone`` 并刷新样式（QSS 里用 [tone="..."] 匹配）。"""
+    widget.setProperty("tone", tone)
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+
+
+def field_label(text: str, parent: QWidget | None = None) -> QLabel:
+    """表单字段标题，避免各处重复三行代码。"""
+    label = QLabel(text, parent)
+    label.setObjectName("fieldLabel")
+    return label
+
+
+def v_field(label: str, widget: QWidget, spacing: int = theme.GAP_SM) -> QVBoxLayout:
+    """"标题 + 控件"的纵向字段布局。"""
+    layout = QVBoxLayout()
+    layout.setSpacing(spacing)
+    layout.addWidget(field_label(label, widget.parentWidget()))
+    layout.addWidget(widget)
+    return layout
+
+
+def h_switch_row(label: str, switch: Switch) -> QHBoxLayout:
+    """"开关 + 说明"的横向行布局。"""
+    layout = QHBoxLayout()
+    layout.setSpacing(theme.GAP_MD)
+    layout.addWidget(switch)
+    text = QLabel(label)
+    text.setObjectName("statusSub")
+    layout.addWidget(text)
+    layout.addStretch()
+    return layout

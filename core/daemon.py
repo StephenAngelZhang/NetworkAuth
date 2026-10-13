@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Optional
@@ -14,6 +15,8 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from core import network as net
 from core.config import ConfigStore, Profile, mask_username
 from core.portal import PortalClient, DEFAULT_CARRIERS
+
+logger = logging.getLogger("networkauth")
 
 # 状态
 STATE_NO_NETWORK = "no_network"
@@ -53,6 +56,10 @@ _CREDENTIAL_ERROR_HINTS = (
 _MIN_DELAY = 5
 _MAX_DELAY = 300
 
+# 登录后等待门户生效：轮询而非固定 sleep，保证注销/手动登录等动作能及时被处理
+_VERIFY_TIMEOUT = 3.0
+_VERIFY_STEP = 0.25
+
 
 class Daemon(QThread):
     """后台守护循环。"""
@@ -63,6 +70,8 @@ class Daemon(QThread):
     loginFinished = pyqtSignal(bool, str)
     logoutFinished = pyqtSignal(bool, str)
     portalConfig = pyqtSignal(object)                  # PortalConfig
+    networkChanged = pyqtSignal(object)                # net.NetworkInfo
+    heartbeat = pyqtSignal(float)                      # 每轮检测结束，参数为下轮间隔（秒）
 
     def __init__(self, store: ConfigStore, parent=None) -> None:
         super().__init__(parent)
@@ -103,11 +112,16 @@ class Daemon(QThread):
         return list(self._carriers)
 
     @property
+    def next_interval(self) -> float:
+        """下一次状态检测的间隔（秒），供界面显示倒计时。"""
+        return float(self._delay)
+
+    @property
     def client(self) -> PortalClient:
+        """门户客户端（按门户地址缓存；登录固定走 GET）。"""
         base = self.store.portal_base
-        method = str(self.store.option("login_method", "GET")).upper()
-        if self._client is None or self._client.base != base or self._client.method != method:
-            self._client = PortalClient(base=base, method=method)
+        if self._client is None or self._client.base != base:
+            self._client = PortalClient(base=base)
         return self._client
 
     # ---------- 请求 ----------
@@ -135,6 +149,12 @@ class Daemon(QThread):
             self._actions.append({"type": "refresh"})
         self._wakeup.set()
 
+    def request_refresh_network(self) -> None:
+        """请求在子线程重新识别网络（界面线程本身不跑子进程）。"""
+        with self._lock:
+            self._actions.append({"type": "network"})
+        self._wakeup.set()
+
     def unblock(self) -> None:
         """清除账号异常导致的暂停状态。"""
         self._blocked = False
@@ -154,7 +174,9 @@ class Daemon(QThread):
             try:
                 self._tick()
             except Exception as exc:  # 保证守护线程不因异常退出
+                logger.exception("守护循环发生异常")
                 self._set_state(STATE_OFFLINE, f"检测异常：{type(exc).__name__}")
+            self.heartbeat.emit(float(self._delay))
             self._sleep(self._delay)
 
     def _sleep(self, seconds: float) -> None:
@@ -168,7 +190,7 @@ class Daemon(QThread):
         self._handle_actions()
 
         info = net.current_network()
-        self._network = info
+        self._set_network(info)
 
         if info.kind == net.NONE:
             self._set_state(STATE_NO_NETWORK, "未检测到网络连接")
@@ -215,17 +237,19 @@ class Daemon(QThread):
             return
 
         info = net.current_network()
-        self._network = info
+        self._set_network(info)
 
         for action in actions:
             kind = action.get("type")
             if kind == "refresh":
                 self._discover()
                 continue
+            if kind == "network":
+                net.invalidate_network_cache()
+                self._set_network(net.current_network(ttl=0), force=True)
+                continue
             if kind == "logout":
-                ok = self.client.logout()
-                self.logoutFinished.emit(ok, "已发送注销请求" if ok else "注销失败，请检查网络")
-                self._delay = 2.0
+                self._do_logout(info)
                 continue
             if kind != "login":
                 continue
@@ -242,10 +266,37 @@ class Daemon(QThread):
             self._blocked = False
             self._do_login(info, profile, bind_to=bind_to, save=save)
 
+    def _do_logout(self, info: net.NetworkInfo) -> None:
+        """注销当前网络上的账号；结果写入日志便于对照门户返回。"""
+        profile = self.store.resolve(info.id or net.ETHERNET_ID)
+        ok = self.client.logout(
+            profile.username if profile else "",
+            profile.password if profile else "",
+            profile.suffix if profile else "",
+        )
+        who = mask_username(profile.username) if profile else "未知账号"
+        if ok:
+            logger.info("注销请求已受理（%s）", who)
+            message = "已发送注销请求"
+        else:
+            logger.warning("注销请求未确认（%s）", who)
+            message = "注销未生效，请检查网络或在门户页面手动注销"
+        self.logoutFinished.emit(ok, message)
+        self._delay = 2.0
+
     def _discover(self) -> None:
         config = self.client.discover(force=True)
         if config.carriers:
             self._carriers = list(config.carriers)
+        logger.info(
+            "门户配置：endpoint=%s program=%s page=%s login_method=%s en_md5=%s discovered=%s",
+            config.api_base(),
+            config.program_index,
+            config.page_index,
+            config.login_method,
+            config.en_md5,
+            config.discovered,
+        )
         self.portalConfig.emit(config)
 
     # ---------- 登录 ----------
@@ -257,21 +308,23 @@ class Daemon(QThread):
         bind_to: Optional[str],
         save: bool,
     ) -> None:
-        self._set_state(STATE_LOGGING, f"正在认证 {mask_username(profile.username)}…")
+        who = mask_username(profile.username)
+        self._set_state(STATE_LOGGING, f"正在认证 {who}…")
+        logger.info("开始认证 %s（网络 %s，绑定 %s）", who, info.label, bind_to or "全局默认")
 
         result = self.client.login(profile.username, profile.password, profile.suffix)
-        time.sleep(2.5)                      # 等待门户上线生效
-        online = net.internet_reachable()
+        online = self._wait_online()          # 可被打断的轮询，替代固定 sleep(2.5)
 
         if online:
             ok = True
             message = "登录成功" if result.verdict != "fail" else f"{result.message}（当前已可上网）"
-        elif result.verdict == "success":
+        elif result.ok:
             ok = True
             message = "门户已接受登录（外网探测未确认）"
         else:
             ok = False
             message = result.message or "认证未生效"
+        logger.info("认证结束 ok=%s verdict=%s message=%s", ok, result.verdict, message)
 
         record = {
             "ts": time.time(),
@@ -318,6 +371,33 @@ class Daemon(QThread):
 
     # ---------- 工具 ----------
 
+    def _wait_online(self) -> bool:
+        """轮询外网连通性确认认证是否生效（最多约 3 秒）。
+
+        与固定 ``sleep`` 的区别：一旦有新的动作请求或收到停止信号就立即返回，
+        不会把注销 / 手动登录堵在动作队列里。
+        """
+        deadline = time.monotonic() + _VERIFY_TIMEOUT
+        while True:
+            if net.internet_reachable(timeout=1.5):
+                return True
+            if self._stop_event.is_set() or self._wakeup.is_set():
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_VERIFY_STEP)
+
+    def _set_network(self, info: net.NetworkInfo, force: bool = False) -> bool:
+        """更新网络身份；发生变化（或 force）时通过信号通知界面。"""
+        previous = self._network
+        changed = (info.kind, info.id, info.label) != (previous.kind, previous.id, previous.label)
+        self._network = info
+        if changed:
+            logger.info("网络变化：%s -> %s", previous.label, info.label)
+        if changed or force:
+            self.networkChanged.emit(info)
+        return changed
+
     def _interval(self, online: bool) -> float:
         key = "interval_online" if online else "interval"
         return float(self.store.option(key, 60 if online else 15))
@@ -327,4 +407,5 @@ class Daemon(QThread):
             return
         self._state = state
         self._message = message
+        logger.debug("状态 -> %s：%s", state, message)
         self.statusChanged.emit(state, message, self._network.label)

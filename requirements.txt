@@ -1,3 +1,4 @@
+# 运行依赖（终端用户）
+# 构建/打包依赖见 requirements-dev.txt
 PyQt6>=6.6.0
 requests>=2.31.0
-pyinstaller>=6.3.0

@@ -3,21 +3,37 @@
 - 当前网络身份：Wi-Fi 用 SSID 标识（netsh），无无线连接且有默认网关则视为有线网。
 - 门户可达性：直接请求门户首页（未认证时也可访问）。
 - 外网连通性：请求微软/苹果的强制门户探测端点，用于判断"是否已认证上网"。
+
+网络识别需要拉起 ``netsh`` / ``ipconfig`` 子进程，代价较高，因此
+``current_network()`` 带 TTL 缓存；界面线程只读缓存，主动刷新时调用
+``invalidate_network_cache()`` 或让守护线程重新探测。
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
+from typing import Optional
 
 import requests
+
+logger = logging.getLogger("networkauth")
 
 WIRELESS = "wireless"
 ETHERNET = "ethernet"
 NONE = "none"
 
 ETHERNET_ID = "ethernet"
+
+CACHE_TTL = 5.0
+
+_cache: Optional["NetworkInfo"] = None
+_cache_ts = 0.0
+_cache_lock = threading.Lock()
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -121,14 +137,39 @@ def has_gateway() -> bool:
     return False
 
 
-def current_network() -> NetworkInfo:
-    """识别当前网络身份。"""
+def _detect_network() -> NetworkInfo:
+    """真实探测当前网络（会拉起子进程，优先走 current_network() 的缓存）。"""
     ssid = wlan_ssid()
     if ssid:
         return NetworkInfo(WIRELESS, f"ssid:{ssid}", ssid)
     if has_gateway():
         return NetworkInfo(ETHERNET, ETHERNET_ID, "有线网络")
     return NetworkInfo(NONE, "", "无网络")
+
+
+def invalidate_network_cache() -> None:
+    """强制失效缓存（手动刷新、网络切换时调用）。"""
+    global _cache, _cache_ts
+    with _cache_lock:
+        _cache = None
+        _cache_ts = 0.0
+
+
+def current_network(ttl: float = CACHE_TTL) -> NetworkInfo:
+    """识别当前网络身份；``ttl`` 秒内复用上次结果，``ttl=0`` 表示强制重新探测。"""
+    global _cache, _cache_ts
+
+    now = time.monotonic()
+    if ttl > 0:
+        with _cache_lock:
+            if _cache is not None and now - _cache_ts < ttl:
+                return _cache
+
+    info = _detect_network()
+    with _cache_lock:
+        _cache = info
+        _cache_ts = time.monotonic()
+    return info
 
 
 def _session() -> requests.Session:
@@ -162,21 +203,3 @@ def internet_reachable(timeout: float = 3.0) -> bool:
         if resp.status_code == 200 and expect in resp.text:
             return True
     return False
-
-
-def local_ip() -> str:
-    """本机在当前网络中的 IPv4 地址（尽力而为，失败返回空串）。"""
-    import socket
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0)
-        sock.connect(("10.255.255.255", 1))
-        return sock.getsockname()[0]
-    except OSError:
-        return ""
-    finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
